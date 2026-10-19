@@ -1,0 +1,447 @@
+@import 'tailwindcss';
+@import 'tw-animate-css';
+
+@custom-variant dark (&:is(.dark *));
+
+:root {
+  /* Hardware synth chassis colors - Light gray theme */
+  --chassis: #d0d4dc;
+  --panel: #e8eaef;
+  --panel-highlight: #ffffff;
+  --panel-shadow: #a0a8b8;
+  --display-bg: #1a1d24;
+  --section-header: #c8ccd4;
+  
+  /* Accent colors per section */
+  --osc-accent: #5865f2;
+  --filter-accent: #a855f7;
+  --env-accent: #f59e0b;
+  --lfo1-accent: #5865f2;
+  --lfo2-accent: #10b981;
+  --lfo3-accent: #a855f7;
+  --lfo4-accent: #f59e0b;
+  --fx-accent: #ef4444;
+  --master-accent: #10b981;
+  --macro-accent: #eab308;
+  
+  /* LED states */
+  --led-off: #b8bcc8;
+  --led-green: #10b981;
+  
+  /* Text colors */
+  --text-section: #4b5563;
+  --text-label: #6b7280;
+  --text-value: #1f2937;
+  --text-display: #10b981;
+  
+  /* Standard shadcn tokens */
+  --background: #d0d4dc;
+  --foreground: #1f2937;
+  --card: #e8eaef;
+  --card-foreground: #1f2937;
+  --popover: #e8eaef;
+  --popover-foreground: #1f2937;
+  --primary: #5865f2;
+  --primary-foreground: #ffffff;
+  --secondary: #c8ccd4;
+  --secondary-foreground: #1f2937;
+  --muted: #d0d4dc;
+  --muted-foreground: #6b7280;
+  --accent: #5865f2;
+  --accent-foreground: #ffffff;
+  --destructive: #ef4444;
+  --destructive-foreground: #ffffff;
+  --border: #b8bcc8;
+  --input: #f3f4f6;
+  --ring: #5865f2;
+  --radius: 0.25rem;
+}
+
+@theme inline {
+  --font-sans: 'Geist', 'Geist Fallback';
+  --font-mono: 'Geist Mono', 'Geist Mono Fallback';
+  --color-background: var(--background);
+  --color-foreground: var(--foreground);
+  --color-card: var(--card);
+  --color-card-foreground: var(--card-foreground);
+  --color-popover: var(--popover);
+  --color-popover-foreground: var(--popover-foreground);
+  --color-primary: var(--primary);
+  --color-primary-foreground: var(--primary-foreground);
+  --color-secondary: var(--secondary);
+  --color-secondary-foreground: var(--secondary-foreground);
+  --color-muted: var(--muted);
+  --color-muted-foreground: var(--muted-foreground);
+  --color-accent: var(--accent);
+  --color-accent-foreground: var(--accent-foreground);
+  --color-destructive: var(--destructive);
+  --color-destructive-foreground: var(--destructive-foreground);
+  --color-border: var(--border);
+  --color-input: var(--input);
+  --color-ring: var(--ring);
+  --radius-sm: calc(var(--radius) - 2px);
+  --radius-md: var(--radius);
+  --radius-lg: calc(var(--radius) + 2px);
+  --radius-xl: calc(var(--radius) + 4px);
+}
+
+@layer base {
+  * {
+    @apply border-border outline-ring/50;
+  }
+  body {
+    @apply bg-[var(--chassis)] text-foreground;
+  }
+}
+
+/* Hardware panel noise texture - light background with subtle gradient */
+.panel-texture {
+  background: linear-gradient(145deg, #c8ccd4 0%, #d8dce4 50%, #c0c4cc 100%);
+}
+
+/* Raised panel effect - with proper 3D depth */
+.panel-raised {
+  background: linear-gradient(145deg, #f0f2f5 0%, #e4e6eb 100%);
+  border-top: 1px solid var(--panel-highlight);
+  border-left: 1px solid var(--panel-highlight);
+  border-bottom: 2px solid var(--panel-shadow);
+  border-right: 2px solid var(--panel-shadow);
+  box-shadow: 
+    4px 4px 8px rgba(0,0,0,0.15),
+    -2px -2px 6px rgba(255,255,255,0.7),
+    inset 0 1px 0 rgba(255,255,255,0.5);
+}
+
+/* Recessed display effect - dark inset screens */
+.panel-recessed {
+  background: var(--display-bg);
+  border-top: 2px solid var(--panel-shadow);
+  border-left: 2px solid var(--panel-shadow);
+  border-bottom: 1px solid var(--panel-highlight);
+  border-right: 1px solid var(--panel-highlight);
+  box-shadow: 
+    inset 2px 2px 6px rgba(0,0,0,0.5),
+    inset -1px -1px 2px rgba(0,0,0,0.2);
+}
+
+/* Engraved border */
+.panel-engraved {
+  border: 1px solid var(--panel-shadow);
+  box-shadow: 
+    inset 0 0 0 1px var(--panel-highlight),
+    2px 2px 4px rgba(0,0,0,0.1);
+}
+
+/* CRT scanline effect for scope */
+.crt-scanlines {
+  background: repeating-linear-gradient(
+    0deg,
+    transparent,
+    transparent 2px,
+    rgba(0, 0, 0, 0.08) 2px,
+    rgba(0, 0, 0, 0.08) 4px
+  );
+}
+
+/* ── react-grid-layout V2 overrides ──────────────────────────────────────── */
+/* Ensure grid items fill their cell completely */
+.react-grid-item {
+  overflow: hidden;
+}
+.react-grid-item > * {
+  width: 100%;
+  height: 100%;
+}
+
+/* Compact V2 tile internals: every functional panel must fit inside its frame. */
+.v2-tile-content {
+  width: 100%;
+  height: 100%;
+  min-width: 0;
+  min-height: 0;
+  display: grid;
+  grid-template-rows: auto minmax(0, 1fr) auto;
+  overflow: hidden;
+}
+
+.v2-mini-knob-row {
+  display: grid;
+  gap: 2px;
+  min-height: 29px;
+  flex-shrink: 0;
+}
+
+.v2-knob-cell {
+  min-width: 0;
+  display: flex;
+  flex-direction: column;
+  align-items: center;
+  justify-content: end;
+  gap: 1px;
+  overflow: hidden;
+}
+
+.v2-knob-cell > span {
+  font-family: var(--font-mono), ui-monospace, SFMono-Regular, Menlo, Monaco, Consolas, "Liberation Mono", monospace;
+  font-size: clamp(5px, 1.25cqmin, 7px);
+  color: var(--text-label);
+  letter-spacing: 0.06em;
+  text-transform: uppercase;
+  line-height: 1;
+  white-space: nowrap;
+}
+
+@container (max-height: 115px) {
+  .v2-mini-knob-row {
+    min-height: 27px;
+  }
+
+  .v2-knob-cell > div {
+    transform: scale(0.92);
+    transform-origin: bottom center;
+    margin-top: -3px;
+  }
+}
+
+@container (max-height: 76px) {
+  .v2-tile-content {
+    gap: 2px !important;
+    padding: 2px !important;
+  }
+
+  .v2-mini-knob-row {
+    min-height: 23px;
+  }
+
+  .v2-knob-cell > span {
+    display: none;
+  }
+
+  .v2-knob-cell > div {
+    transform: scale(0.78);
+    margin-top: -8px;
+  }
+}
+
+/* ═══════════════════════════════════════════════════════════════
+   Oscillator Tab Icon Animations
+   All keyframes use only transform / opacity / stroke-dashoffset
+   → 100% GPU-composited, zero CPU reflow.
+   Inactive tabs have animationName:"none" (no animation overhead).
+   ═══════════════════════════════════════════════════════════════ */
+
+/* VA — sawtooth phase scroll (period = 4 px) */
+@keyframes osc-va-scroll {
+  from { transform: translateX(0); }
+  to   { transform: translateX(-4px); }
+}
+
+/* WAVE — sine phase scroll (period = 9 px) */
+@keyframes osc-wave-scroll {
+  from { transform: translateX(0); }
+  to   { transform: translateX(-9px); }
+}
+
+/* WAVE panel — wavetable one-shot scan cursor */
+@keyframes osc-wt-scan {
+  from { transform: translateX(0); }
+  to   { transform: translateX(120px); }
+}
+
+/* FM — complex waveform ScaleY pulse */
+@keyframes osc-fm-pulse {
+  0%, 100% { transform: scaleY(0.78); }
+  50%       { transform: scaleY(1.05); }
+}
+
+/* FM panel — tiny SVG signal-flow dash offset; only visible while FM tile is shown */
+@keyframes osc-fm-flow {
+  from { stroke-dashoffset: 0; }
+  to   { stroke-dashoffset: -12; }
+}
+
+/* GRAN — individual grain opacity + scale flicker */
+@keyframes osc-gran-dot {
+  0%, 100% { opacity: 0.15; transform: scale(0.65); }
+  50%       { opacity: 1;   transform: scale(1.45); }
+}
+
+/* MODAL — damped sine path draw/reset */
+@keyframes osc-modal-draw {
+  0%   { stroke-dashoffset: 100; opacity: 0.25; }
+  65%  { stroke-dashoffset: 0;   opacity: 1;    }
+  88%  { stroke-dashoffset: 0;   opacity: 0.8;  }
+  100% { stroke-dashoffset: 100; opacity: 0.25; }
+}
+
+/* ADD — each harmonic bar scaleY bounce (transform-origin set inline per bar) */
+@keyframes osc-add-bar {
+  0%, 100% { transform: scaleY(0.55); opacity: 0.5; }
+  50%       { transform: scaleY(1.0);  opacity: 1;   }
+}
+
+/* SAMP — playhead cursor sweep */
+@keyframes osc-samp-cursor {
+  0%   { transform: translateX(0);     opacity: 0; }
+  8%   { opacity: 1; }
+  92%  { opacity: 1; }
+  100% { transform: translateX(18px);  opacity: 0; }
+}
+
+/* Resize handle — bottom-right grip, matches panel aesthetic */
+.react-resizable-handle {
+  position: absolute;
+  bottom: 2px;
+  right: 2px;
+  width: 14px;
+  height: 14px;
+  background: transparent;
+  cursor: se-resize;
+  z-index: 10;
+}
+.react-resizable-handle::after {
+  content: "";
+  position: absolute;
+  bottom: 2px;
+  right: 2px;
+  width: 8px;
+  height: 8px;
+  border-right: 2px solid var(--panel-shadow);
+  border-bottom: 2px solid var(--panel-shadow);
+  border-radius: 0 0 2px 0;
+  opacity: 0.5;
+  transition: opacity 160ms ease, border-color 160ms ease;
+}
+.react-resizable-handle:hover::after,
+.react-grid-item.react-resizable-resizing .react-resizable-handle::after {
+  opacity: 1;
+  border-color: #5865f2;
+}
+/* S (bottom) handle */
+.react-resizable-handle-s {
+  bottom: 2px;
+  right: 50%;
+  transform: translateX(50%);
+  cursor: s-resize;
+}
+.react-resizable-handle-s::after {
+  border-right: none;
+  border-bottom: 2px solid var(--panel-shadow);
+  width: 12px;
+  height: 4px;
+}
+/* E (right) handle */
+.react-resizable-handle-e {
+  right: 2px;
+  top: 50%;
+  transform: translateY(-50%);
+  cursor: e-resize;
+}
+.react-resizable-handle-e::after {
+  border-bottom: none;
+  border-right: 2px solid var(--panel-shadow);
+  width: 4px;
+  height: 12px;
+}
+.react-resizable-handle-n {
+  top: 2px;
+  bottom: auto;
+  right: 50%;
+  transform: translateX(50%);
+  cursor: n-resize;
+}
+.react-resizable-handle-n::after {
+  top: 2px;
+  bottom: auto;
+  border-right: none;
+  border-bottom: none;
+  border-top: 2px solid var(--panel-shadow);
+  width: 12px;
+  height: 4px;
+}
+.react-resizable-handle-w {
+  left: 2px;
+  right: auto;
+  top: 50%;
+  bottom: auto;
+  transform: translateY(-50%);
+  cursor: w-resize;
+}
+.react-resizable-handle-w::after {
+  left: 2px;
+  right: auto;
+  top: 2px;
+  bottom: auto;
+  border-right: none;
+  border-bottom: none;
+  border-left: 2px solid var(--panel-shadow);
+  width: 4px;
+  height: 12px;
+}
+.react-resizable-handle-ne {
+  top: 2px;
+  bottom: auto;
+  right: 2px;
+  cursor: ne-resize;
+}
+.react-resizable-handle-ne::after {
+  top: 2px;
+  bottom: auto;
+  border-bottom: none;
+  border-left: none;
+  border-top: 2px solid var(--panel-shadow);
+  border-right: 2px solid var(--panel-shadow);
+  border-radius: 0 2px 0 0;
+}
+.react-resizable-handle-nw {
+  top: 2px;
+  bottom: auto;
+  left: 2px;
+  right: auto;
+  cursor: nw-resize;
+}
+.react-resizable-handle-nw::after {
+  top: 2px;
+  bottom: auto;
+  left: 2px;
+  right: auto;
+  border-bottom: none;
+  border-right: none;
+  border-top: 2px solid var(--panel-shadow);
+  border-left: 2px solid var(--panel-shadow);
+  border-radius: 2px 0 0 0;
+}
+.react-resizable-handle-sw {
+  left: 2px;
+  right: auto;
+  bottom: 2px;
+  cursor: sw-resize;
+}
+.react-resizable-handle-sw::after {
+  left: 2px;
+  right: auto;
+  border-right: none;
+  border-top: none;
+  border-left: 2px solid var(--panel-shadow);
+  border-bottom: 2px solid var(--panel-shadow);
+  border-radius: 0 0 0 2px;
+}
+
+/* Dragging placeholder — ghost tile */
+.react-grid-item.react-grid-placeholder {
+  background: rgba(88, 101, 242, 0.12) !important;
+  border: 1px dashed rgba(88, 101, 242, 0.4) !important;
+  border-radius: 4px;
+}
+
+/* Drag-handle cursor feedback */
+.tile-drag-handle:active {
+  cursor: grabbing !important;
+}
+
+/* ── Hide Next.js Dev Tools button (the "N" button) ── */
+button[title="Open Next.js Dev Tools"],
+nextjs-portal,
+#__next-build-watcher {
+  display: none !important;
+}

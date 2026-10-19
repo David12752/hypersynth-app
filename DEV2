@@ -1,0 +1,949 @@
+# HyperSynth — Wind Controller Modulator System
+
+## Role & Context
+
+You are implementing a **Wind Controller Modulator System** for HyperSynth, a professional polyphonic synthesizer built in **Rust/WASM** with a **React/TypeScript** UI. This system sits as a processing layer between incoming MIDI input and the synthesis engine, specifically optimized for **Akai EWI**, **Yamaha WX**, **Roland Aerophone**, and **Berglund NuRAD** wind controllers.
+
+The existing codebase already has:
+- A working Rust audio engine (`hypersynth-engine/engine/`) compiled to WASM via `wasm-pack`
+- VA oscillator with PolyBLEP anti-aliasing
+- Moog Ladder filter and SVF (State Variable Filter)
+- 8-voice polyphony with voice allocation
+- ADSR envelope generator
+- LFO with 5 waveforms (sine, triangle, saw, square, S&H)
+- Basic mod matrix infrastructure
+- React UI connected via `AudioBridge.ts` through Web Audio API AudioWorklet
+- Parameter system with `ParamId` enum and TypeScript auto-generation
+
+**Do NOT modify or refactor existing oscillator, filter, or FX code.** This task adds a new subsystem only.
+
+---
+
+## Architecture Overview
+
+```
+MIDI Input (CC2, CC11, PitchBend, NoteOn/Off, Aftertouch)
+         │
+         ▼
+┌─────────────────────────────────────┐
+│   WindControllerProcessor (Rust)    │
+│                                     │
+│  ┌───────────┐  ┌────────────────┐  │
+│  │ CC Input   │  │ Note Manager   │  │
+│  │ Smoother   │  │ (Mono/Legato)  │  │
+│  └─────┬─────┘  └───────┬────────┘  │
+│        │                 │           │
+│  ┌─────▼─────────────────▼────────┐  │
+│  │     Breath Routing Matrix      │  │
+│  │  CC2 → VCA, Filter, Drive      │  │
+│  └─────┬──────────────────────────┘  │
+│        │                             │
+│  ┌─────▼──────────┐  ┌───────────┐  │
+│  │ Pitch Processor │  │ Growl &   │  │
+│  │ (Bend + Vibrato)│  │ Flutter   │  │
+│  └─────┬──────────┘  └─────┬─────┘  │
+│        │                    │        │
+│  ┌─────▼────────────────────▼─────┐  │
+│  │   Output: processed params     │  │
+│  │   → feed into existing engine  │  │
+│  └────────────────────────────────┘  │
+└─────────────────────────────────────┘
+         │
+         ▼
+   Existing Synth Engine (untouched)
+```
+
+---
+
+## File Structure
+
+Create all new files under `engine/src/wind/`. Do not scatter files across existing directories.
+
+```
+engine/src/
+├── wind/
+│   ├── mod.rs                  // pub mod declarations + WindControllerProcessor
+│   ├── smoother.rs             // One-pole parameter smoothing
+│   ├── note_manager.rs         // Mono/legato/portamento note handling
+│   ├── breath_router.rs        // CC2 → multi-destination routing with curves
+│   ├── pitch_processor.rs      // PitchBend handling + vibrato LFO
+│   ├── articulation.rs         // Growl, flutter tonguing, sub-harmonics
+│   ├── breath_curve.rs         // Response curve math (linear/exp/log/S-curve)
+│   └── config.rs               // All wind controller configuration parameters
+```
+
+In the UI, create:
+```
+ui/src/components/wind/
+├── WindControllerPanel.tsx      // Main tab container
+├── BreathCurveEditor.tsx        // Interactive curve editor (Canvas-based)
+├── BreathRoutingMatrix.tsx      // Visual routing CC2 → destinations
+├── ArticulationControls.tsx     // Growl/flutter/legato settings
+├── WindPresetSelector.tsx       // Preset selector (EWI, WX, Aerophone, Custom)
+└── WindMeter.tsx                // Real-time breath/bite pressure meter
+```
+
+---
+
+## Phase 1: Parameter Smoothing (`smoother.rs`)
+
+### Problem
+Wind controller CC values arrive at ~500Hz update rate with 7-bit resolution (0–127). Feeding raw values directly into synthesis parameters causes audible zipper noise (staircase artifacts).
+
+### Implementation
+
+```rust
+/// One-pole IIR low-pass smoother for parameter values.
+/// This is the industry standard for CC smoothing in every major
+/// synth plugin (Diva, Zebra, Serum, Pigments).
+///
+/// Transfer function: y[n] = y[n-1] + coeff * (target - y[n-1])
+/// where coeff = 1.0 - exp(-1.0 / (tau * sample_rate))
+pub struct ParameterSmoother {
+    current: f32,
+    target: f32,
+    coeff: f32,
+    sample_rate: f32,
+}
+```
+
+**Requirements:**
+
+1. Implement `ParameterSmoother` with these methods:
+   - `new(sample_rate: f32, time_constant_ms: f32) -> Self`
+   - `set_target(&mut self, value: f32)` — called when a new CC value arrives
+   - `set_time_constant(&mut self, ms: f32)` — recalculates coefficient; range 1ms–500ms
+   - `next(&mut self) -> f32` — called once per sample, returns smoothed value
+   - `next_block(&mut self, output: &mut [f32])` — fills a block; if |target - current| < 1e-6, fill with constant (skip computation)
+   - `is_settled(&self) -> bool` — true when |target - current| < 1e-6
+   - `snap(&mut self)` — immediately sets current = target (for initialization)
+
+2. The default time constant is **5ms** (industry standard). Expose a user-facing parameter labeled **"Response Time"** with range 1ms–200ms. Internally store and display in milliseconds, convert to coefficient using: `coeff = 1.0 - (-1.0 / (time_ms * 0.001 * sample_rate)).exp()`
+
+3. Create a `SmootherBank` struct that holds one `ParameterSmoother` per wind controller input:
+   - `breath` (CC2)
+   - `expression` (CC11)
+   - `pitch_bend` (14-bit, range -8192..+8191 normalized to -1.0..+1.0)
+   - `bite_pressure` (CC mapped from bite sensor, typically CC1 or Aftertouch)
+   - `growl_cc` (user-assignable CC number)
+   - `flutter_cc` (user-assignable CC number)
+
+4. **All smoothers must be `no_std` compatible.** Use `libm` for `exp()`. No allocations in `next()` or `next_block()`.
+
+5. Write unit tests: step response convergence within 3 * time_constant, snap behavior, block processing matches sample-by-sample.
+
+---
+
+## Phase 2: Monophonic Note Manager (`note_manager.rs`)
+
+### Problem
+Wind instruments are inherently monophonic. When the player fingers a new note before releasing the previous one, the synth must handle this as a legato transition — not re-trigger envelopes. Standard polyphonic voice allocation is wrong for this use case.
+
+### Implementation
+
+```rust
+pub enum NoteMode {
+    /// Standard poly mode (bypass NoteManager, use existing voice allocator)
+    Poly,
+    /// Monophonic: always re-trigger envelopes, last-note priority
+    Mono,
+    /// Legato: only re-trigger on first note; pitch glides on held transitions
+    Legato,
+}
+
+pub enum NoteEvent {
+    /// New note, envelopes should re-trigger
+    NewNote { note: u8, velocity: u8 },
+    /// Legato transition, only pitch changes (envelopes continue)
+    LegatoSlide { from_note: u8, to_note: u8, velocity: u8 },
+    /// All notes released — begin release phase
+    AllNotesOff,
+}
+
+pub struct NoteManager {
+    mode: NoteMode,
+    /// Stack of currently held notes (most recent = top). Max 10 entries.
+    note_stack: [u8; 10],
+    stack_size: usize,
+    current_note: Option<u8>,
+    portamento_active: bool,
+}
+```
+
+**Requirements:**
+
+1. `NoteManager` uses a **fixed-size stack** (no Vec, no heap). Maximum 10 simultaneous held notes is more than any wind controller can produce.
+
+2. Note priority is **Last Note Priority** — always play the most recently pressed note. When that note is released, fall back to the previous note in the stack (if still held).
+
+3. Implement `process_note_on(&mut self, note: u8, velocity: u8) -> NoteEvent`:
+   - In `Poly` mode: always return `NewNote`
+   - In `Mono` mode: always return `NewNote`, push to stack
+   - In `Legato` mode: if stack is empty, return `NewNote`. If stack has notes, return `LegatoSlide { from: current, to: new }`
+
+4. Implement `process_note_off(&mut self, note: u8) -> Option<NoteEvent>`:
+   - Remove the note from the stack regardless of position
+   - If the released note was the current playing note AND stack still has notes: return `LegatoSlide` to the new top-of-stack
+   - If stack is now empty: return `AllNotesOff`
+   - If released note was NOT the current playing note: return `None` (no audible change)
+
+5. **Fingered Portamento** — separate struct:
+
+```rust
+pub struct PortamentoProcessor {
+    current_pitch: f32,     // in semitones (MIDI note number, fractional)
+    target_pitch: f32,
+    rate: f32,              // semitones per sample
+    active: bool,
+    mode: PortamentoMode,
+}
+
+pub enum PortamentoMode {
+    /// Always glide between notes
+    Always,
+    /// Only glide on legato transitions (fingered portamento)
+    Fingered,
+    /// Never glide
+    Off,
+}
+```
+
+6. Portamento time parameter: range 0ms–2000ms, labeled **"Glide Time"**. Convert to rate: `rate = semitone_distance / (time_ms * 0.001 * sample_rate)`. Rate must be recalculated on each new note based on the interval distance.
+
+7. In `Fingered` mode: glide only occurs when `NoteEvent::LegatoSlide` is produced. On `NewNote`, pitch jumps immediately.
+
+8. Write tests: legato detection, note stack overflow handling, portamento convergence.
+
+---
+
+## Phase 3: Breath Routing Matrix (`breath_router.rs`)
+
+### Problem
+CC2 (Breath Control) is the primary expression source on wind controllers. To produce a realistic, living sound, a single breath stream must simultaneously control multiple synthesis parameters with independent scaling, curves, and polarity.
+
+### Implementation
+
+```rust
+/// A single routing from breath to a synthesis parameter.
+pub struct BreathRoute {
+    pub destination: BreathDestination,
+    pub amount: f32,          // -1.0 to +1.0 (bipolar)
+    pub curve: BreathCurve,   // response curve type
+    pub enabled: bool,
+}
+
+pub enum BreathDestination {
+    /// Direct amplitude control — most important, gives dynamic range
+    Amplitude,
+    /// Filter cutoff — opens/closes with breath intensity
+    FilterCutoff,
+    /// Harmonic exciter / soft saturation — adds overtones at high breath
+    HarmonicDrive,
+    /// Filter resonance — subtle, adds edge at high pressure
+    FilterResonance,
+    /// LFO depth — breath controls vibrato intensity
+    VibratoDepth,
+    /// Pitch (subtle) — slight pitch rise with pressure, like real reed
+    PitchBend,
+    /// Noise level — breath noise component for realism
+    NoiseLevel,
+}
+
+pub enum BreathCurve {
+    Linear,
+    Exponential,    // more control at low values, aggressive at top
+    Logarithmic,    // quick response, plateaus at top
+    SCurve,         // gentle start and end, fast middle
+    Custom(usize),  // index into user-defined curve table
+}
+```
+
+**Requirements:**
+
+1. `BreathRouter` holds up to **8 routes** (fixed array, no heap). Default configuration:
+   - Route 0: Amplitude, amount=1.0, Exponential curve, enabled
+   - Route 1: FilterCutoff, amount=0.6, Exponential curve, enabled
+   - Route 2: HarmonicDrive, amount=0.3, SCurve, disabled by default
+
+2. Curve math in `breath_curve.rs`:
+   ```
+   Linear:      output = input
+   Exponential: output = (exp(input * k) - 1.0) / (exp(k) - 1.0)  where k = 4.0
+   Logarithmic: output = ln(1.0 + input * (exp(k) - 1.0)) / k      where k = 4.0
+   S-Curve:     output = 0.5 * (1.0 + tanh(k * (input - 0.5)) / tanh(k * 0.5))  where k = 3.0
+   Custom:      linear interpolation over a 128-point lookup table
+   ```
+   All functions: input [0.0, 1.0] → output [0.0, 1.0]. Use `libm` for transcendentals.
+
+3. `BreathRouter::process(&mut self, breath_value: f32) -> BreathOutput`:
+   - `breath_value` is the already-smoothed CC2 value normalized to 0.0–1.0
+   - Apply the configured curve to the input
+   - Multiply by route amount
+   - Return a struct with all destination values:
+   ```rust
+   pub struct BreathOutput {
+       pub amplitude: f32,
+       pub filter_cutoff: f32,
+       pub harmonic_drive: f32,
+       pub filter_resonance: f32,
+       pub vibrato_depth: f32,
+       pub pitch_offset: f32,
+       pub noise_level: f32,
+   }
+   ```
+
+4. **Breath Threshold** — minimum CC2 value before producing sound. Below threshold: all outputs = 0. Implement a small hysteresis window (threshold ± 2 on 0–127 scale) to prevent on/off flutter at the edge. User parameter: **"Breath Threshold"**, range 0–30 (on 0–127 CC scale). Default: 5.
+
+5. All computation per-sample, no allocations, `no_std` compatible.
+
+---
+
+## Phase 4: Pitch Processor (`pitch_processor.rs`)
+
+### Problem
+Wind controllers send high-resolution pitch bend (14-bit) from the bite sensor (mouthpiece). Beyond simple pitch transposition, professional wind synths use bite pressure to control vibrato depth and rate, enabling expressive vibrato that responds to jaw pressure like a real reed instrument.
+
+### Implementation
+
+```rust
+pub struct PitchProcessor {
+    /// Pitch bend range in semitones (default: ±2, range: ±1 to ±24)
+    bend_range: f32,
+    /// Dedicated vibrato LFO — separate from the main synth LFOs
+    vibrato_lfo: VibratoLfo,
+    /// How the bite sensor maps to vibrato
+    bite_mode: BiteMode,
+}
+
+pub enum BiteMode {
+    /// Bite controls pitch bend directly (default EWI behavior)
+    PitchBend,
+    /// Bite controls vibrato depth (LFO amount)
+    VibratoDepth,
+    /// Bite controls vibrato rate (LFO frequency)
+    VibratoRate,
+    /// Bite controls both depth and rate simultaneously
+    VibratoFull,
+}
+
+pub struct VibratoLfo {
+    phase: f32,
+    frequency: f32,       // Hz, default 5.5 (typical sax vibrato)
+    depth: f32,            // semitones, default 0.3
+    waveform: VibratoWave,
+    sample_rate: f32,
+}
+
+pub enum VibratoWave {
+    Sine,       // standard, smooth vibrato
+    Triangle,   // slightly sharper, classical woodwind feel
+    Ramp,       // asymmetric, jazz-style "scoop" vibrato
+}
+```
+
+**Requirements:**
+
+1. `VibratoLfo` generates one sample at a time via `next(&mut self) -> f32`, returns value in semitones (e.g., ±0.3 semitones). Phase increment: `freq / sample_rate`. No heap, no allocations.
+
+2. Pitch processing chain:
+   ```
+   final_pitch_offset =
+       (pitch_bend_normalized * bend_range)   // direct bend
+     + (vibrato_lfo.next() * effective_depth)  // vibrato component
+     + (breath_output.pitch_offset)            // from breath router
+   ```
+
+3. In `BiteMode::VibratoDepth`: the bite sensor value (0.0–1.0) directly scales `vibrato_lfo.depth`. Zero bite = no vibrato. Full bite = max configured depth.
+
+4. In `BiteMode::VibratoRate`: bite value maps to frequency range (configurable, default 3Hz–8Hz).
+
+5. In `BiteMode::VibratoFull`: bite controls both, with separate scaling. depth_amount and rate_amount are independent parameters.
+
+6. **Vibrato delay** — real players don't start vibrato immediately. Add a `delay_ms` parameter (0–500ms, default 200ms) that ramps vibrato depth from 0 to target over that duration after each new note. Reset on `NoteEvent::NewNote`, but NOT on `LegatoSlide`.
+
+7. User-facing parameters:
+   - **"Bend Range"**: ±1 to ±24 semitones, default ±2
+   - **"Vibrato Rate"**: 1Hz–12Hz, default 5.5Hz
+   - **"Vibrato Depth"**: 0–2 semitones, default 0.3
+   - **"Vibrato Delay"**: 0–500ms, default 200ms
+   - **"Vibrato Shape"**: Sine / Triangle / Ramp
+   - **"Bite Mode"**: PitchBend / VibratoDepth / VibratoRate / VibratoFull
+
+---
+
+## Phase 5: Articulation Effects (`articulation.rs`)
+
+### Problem
+Growl and flutter tonguing are essential expressive techniques for jazz, fusion, and world music wind playing. These are NOT standard effects — they are performance articulations that must respond in real-time to player gestures via assignable CCs.
+
+### Implementation
+
+```rust
+pub struct GrowlProcessor {
+    /// Low-frequency noise modulator — not a standard LFO.
+    /// Growl is irregular by nature (vocal cord vibration).
+    noise_phase: f32,
+    lfo_phase: f32,
+    /// Mix between periodic LFO and noise components
+    chaos: f32,     // 0.0 = pure LFO (regular growl), 1.0 = pure noise (raspy growl)
+    frequency: f32, // Hz, 20–40Hz typical growl range
+    depth: f32,     // 0.0–1.0, controlled by CC
+    active: bool,
+    sample_rate: f32,
+}
+
+pub struct FlutterProcessor {
+    /// Rapid periodic modulation simulating flutter tonguing
+    phase: f32,
+    frequency: f32,  // Hz, 15–25Hz typical flutter range
+    depth: f32,
+    active: bool,
+    sample_rate: f32,
+}
+```
+
+**Requirements:**
+
+1. **Growl** produces a modulation signal applied to amplitude AND pitch simultaneously:
+   - Amplitude modulation: ±depth (creates the volume wobble)
+   - Pitch modulation: ±depth * 0.15 semitones (creates the pitch instability)
+   - The modulation signal itself is: `lfo_component * (1.0 - chaos) + noise_component * chaos`
+   - LFO component: sine wave at `frequency` Hz
+   - Noise component: sample-and-hold random at `frequency` rate (new random value every `sample_rate / frequency` samples)
+   - Noise must use a simple deterministic PRNG (xorshift32), not system random.
+
+2. **Flutter** produces a modulation signal applied to amplitude AND filter cutoff:
+   - Amplitude modulation: pulsed between 0.0 and 1.0 at `frequency` (like rapid re-articulation)
+   - Filter modulation: inverse of amplitude (filter opens when amplitude dips)
+   - Use a smoothed square wave (tanh-shaped) for the pulse, not a hard square
+
+3. Both processors output a `ArticulationOutput`:
+   ```rust
+   pub struct ArticulationOutput {
+       pub amplitude_mod: f32,    // multiply with voice amplitude
+       pub pitch_mod: f32,        // add to pitch in semitones
+       pub filter_mod: f32,       // add to filter cutoff (normalized)
+   }
+   ```
+
+4. CC control: `depth` is set by the assignable CC (0–127 → 0.0–1.0), passed through a `ParameterSmoother` (fast setting, ~3ms). When CC = 0, the processor outputs neutral values (1.0 for amplitude_mod, 0.0 for pitch_mod and filter_mod).
+
+5. User-facing parameters:
+   - **"Growl CC"**: MIDI CC number, default 80
+   - **"Growl Frequency"**: 15–50Hz, default 28Hz
+   - **"Growl Chaos"**: 0%–100%, default 40%
+   - **"Flutter CC"**: MIDI CC number, default 81
+   - **"Flutter Frequency"**: 10–35Hz, default 18Hz
+
+---
+
+## Phase 6: Top-Level Processor (`mod.rs`)
+
+### The Integration Point
+
+```rust
+pub struct WindControllerProcessor {
+    pub config: WindConfig,
+    smoother_bank: SmootherBank,
+    note_manager: NoteManager,
+    portamento: PortamentoProcessor,
+    breath_router: BreathRouter,
+    pitch_processor: PitchProcessor,
+    growl: GrowlProcessor,
+    flutter: FlutterProcessor,
+    enabled: bool, // bypass entire wind system when not using wind controller
+}
+
+/// Output consumed by the main synth engine each sample
+pub struct WindOutput {
+    /// Current pitch in semitones (MIDI note + portamento + vibrato + growl pitch)
+    pub pitch: f32,
+    /// Amplitude multiplier (breath amplitude * growl amplitude * flutter amplitude)
+    pub amplitude: f32,
+    /// Filter cutoff offset (breath cutoff + flutter cutoff), normalized 0–1
+    pub filter_cutoff_mod: f32,
+    /// Filter resonance offset from breath
+    pub filter_resonance_mod: f32,
+    /// Drive/saturation amount from breath
+    pub harmonic_drive: f32,
+    /// Noise component level
+    pub noise_level: f32,
+    /// Note event (if any occurred this block)
+    pub note_event: Option<NoteEvent>,
+    /// True if currently producing sound (breath above threshold)
+    pub gate: bool,
+}
+```
+
+**Requirements:**
+
+1. `WindControllerProcessor::process_sample(&mut self) -> WindOutput` — called once per sample. This combines all sub-processors:
+   ```
+   smoothed_breath = smoother_bank.breath.next()
+   breath_output = breath_router.process(smoothed_breath)
+   pitch_output = pitch_processor.process(smoothed_bite, current_pitch_bend)
+   growl_output = growl.process()
+   flutter_output = flutter.process()
+
+   WindOutput {
+       pitch: portamento.current_pitch + pitch_output + growl_output.pitch_mod,
+       amplitude: breath_output.amplitude * growl_output.amplitude_mod * flutter_output.amplitude_mod,
+       filter_cutoff_mod: breath_output.filter_cutoff + flutter_output.filter_mod,
+       filter_resonance_mod: breath_output.filter_resonance,
+       harmonic_drive: breath_output.harmonic_drive,
+       noise_level: breath_output.noise_level,
+       note_event: pending_note_event.take(),
+       gate: smoothed_breath > threshold,
+   }
+   ```
+
+2. MIDI input methods (called from the MIDI handler, not per-sample):
+   - `handle_note_on(&mut self, note: u8, velocity: u8)`
+   - `handle_note_off(&mut self, note: u8)`
+   - `handle_cc(&mut self, cc: u8, value: u8)` — routes to correct smoother based on CC number
+   - `handle_pitch_bend(&mut self, msb: u8, lsb: u8)` — combines to 14-bit, normalizes to -1.0..+1.0
+   - `handle_aftertouch(&mut self, value: u8)` — routes to bite pressure if configured
+
+3. `WindConfig` holds ALL user-facing parameters for this system. Define every parameter with its `ParamId` following the existing enum convention in `engine/src/params.rs`. Add a new range of IDs for wind controller parameters (suggest starting at 500).
+
+4. Expose a `set_param(&mut self, id: ParamId, value: f32)` method that routes parameter changes to the correct sub-processor.
+
+5. Add `enabled: bool` flag. When disabled, `process_sample` returns a passthrough `WindOutput` with neutral values and the raw note events — zero CPU overhead.
+
+---
+
+## Phase 7: React UI (`ui/src/components/wind/`)
+
+### WindControllerPanel.tsx
+
+This is a new tab in the main UI navigation. Add "WIND" to the existing tab bar alongside MAIN/MIXER/PRESETS/MODULATION/FX/SETTINGS.
+
+**Layout (single scrollable panel):**
+
+```
+┌─────────────────────────────────────────────────────┐
+│  WIND CONTROLLER                    [ENABLED ●]     │
+│  ┌─────────────────────────────────────────────────┐│
+│  │ Preset: [EWI 4000s ▾] [WX5 ▾] [Aerophone ▾]   ││
+│  │         [NuRAD ▾]    [Custom ▾]                 ││
+│  └─────────────────────────────────────────────────┘│
+│                                                     │
+│  ┌── BREATH ───────────────────────────────────────┐│
+│  │                                                  ││
+│  │  ┌─Response Curve──────┐  Threshold  ████░░  5  ││
+│  │  │  [interactive       │  Response   ████░░  5ms││
+│  │  │   curve editor      │                        ││
+│  │  │   256x160 canvas]   │  ┌─ Live Meter ──────┐ ││
+│  │  │  [Lin][Exp][Log][S] │  │  ████████████░░░  │ ││
+│  │  └─────────────────────┘  │  87 / 127         │ ││
+│  │                            └──────────────────┘ ││
+│  └──────────────────────────────────────────────────┘│
+│                                                     │
+│  ┌── ROUTING ──────────────────────────────────────┐│
+│  │  CC2 → Amplitude     [━━━━━━━━●━] 100%  [●]    ││
+│  │  CC2 → Filter Cutoff [━━━━━●━━━━]  60%  [●]    ││
+│  │  CC2 → Harmonic Drive[━━●━━━━━━━]  30%  [ ]    ││
+│  │  CC2 → Resonance     [━━━━━━━━━━]   0%  [ ]    ││
+│  │  CC2 → Vibrato Depth [━━━━━━━━━━]   0%  [ ]    ││
+│  │  CC2 → Pitch         [━━━━━━━━━━]   0%  [ ]    ││
+│  │  CC2 → Noise         [━━━━━━━━━━]   0%  [ ]    ││
+│  └──────────────────────────────────────────────────┘│
+│                                                     │
+│  ┌── NOTE MODE ────────────────────────────────────┐│
+│  │  Mode: [Poly][Mono●][Legato]                    ││
+│  │  Glide: [Off][Fingered●][Always]   Time: 80ms   ││
+│  └──────────────────────────────────────────────────┘│
+│                                                     │
+│  ┌── PITCH & VIBRATO ─────────────────────────────┐│
+│  │  Bend Range: ±2 semi    Bite Mode: [PB●][VD]   ││
+│  │                                    [VR][Full]   ││
+│  │  Vib Rate: 5.5Hz   Depth: 0.3st   Delay: 200ms ││
+│  │  Shape: [Sin●][Tri][Ramp]                       ││
+│  └──────────────────────────────────────────────────┘│
+│                                                     │
+│  ┌── ARTICULATION ─────────────────────────────────┐│
+│  │  GROWL          CC: [80]  Freq: 28Hz  Chaos: 40%││
+│  │  FLUTTER        CC: [81]  Freq: 18Hz            ││
+│  └──────────────────────────────────────────────────┘│
+└─────────────────────────────────────────────────────┘
+```
+
+### BreathCurveEditor.tsx — Interactive Canvas Component
+
+This is the most important UI element. Build it as a **Canvas 2D** component (not SVG — needs 60fps redraw for real-time input visualization).
+
+**Requirements:**
+
+1. Canvas size: 256×160px, with dark background matching the synth theme.
+2. Draw the response curve as a smooth line (128 points minimum). Color: bright accent (e.g., cyan/teal).
+3. Below the curve buttons: [Linear] [Exponential] [Logarithmic] [S-Curve] [Custom].
+4. In **Custom** mode: the user can click/drag to create up to 8 breakpoints on the curve. Interpolation between points is cubic Hermite spline.
+5. **Real-time input visualization**: when the user plays, draw a moving dot on the curve showing current input (X) → output (Y) position. The dot should leave a fading trail (last 30 frames).
+6. Send curve type + custom points to the Rust engine via the existing parameter bridge (`AudioBridge.ts`).
+
+### WindMeter.tsx — Real-Time Breath Meter
+
+1. Vertical meter bar showing current smoothed CC2 value.
+2. Mark the threshold line with a distinct color.
+3. Peak hold indicator (holds highest value for 1 second, then decays).
+4. Refresh at requestAnimationFrame rate. Get values from the engine via a shared ring buffer or polling mechanism (whatever is already used for oscilloscope data).
+
+### WindPresetSelector.tsx — Controller Presets
+
+Provide factory presets that configure the entire wind system for specific controllers:
+
+```typescript
+const WIND_PRESETS = {
+  "EWI 4000s": {
+    breathCC: 2, biteMode: "PitchBend", bendRange: 2,
+    breathCurve: "Exponential", threshold: 5,
+    noteMode: "Legato", portamento: "Fingered", glideTime: 80,
+    routes: [
+      { dest: "Amplitude", amount: 1.0, curve: "Exponential" },
+      { dest: "FilterCutoff", amount: 0.6, curve: "Exponential" },
+    ]
+  },
+  "Yamaha WX5": {
+    breathCC: 2, biteMode: "VibratoDepth", bendRange: 2,
+    breathCurve: "Linear", threshold: 8,
+    noteMode: "Legato", portamento: "Fingered", glideTime: 60,
+    routes: [
+      { dest: "Amplitude", amount: 1.0, curve: "Linear" },
+      { dest: "FilterCutoff", amount: 0.4, curve: "Linear" },
+    ]
+  },
+  "Roland Aerophone": {
+    breathCC: 2, biteMode: "PitchBend", bendRange: 2,
+    breathCurve: "SCurve", threshold: 3,
+    noteMode: "Legato", portamento: "Fingered", glideTime: 50,
+    routes: [
+      { dest: "Amplitude", amount: 1.0, curve: "SCurve" },
+      { dest: "FilterCutoff", amount: 0.5, curve: "SCurve" },
+      { dest: "HarmonicDrive", amount: 0.2, curve: "Exponential" },
+    ]
+  },
+  "Berglund NuRAD": {
+    breathCC: 2, biteMode: "VibratoFull", bendRange: 4,
+    breathCurve: "Exponential", threshold: 3,
+    noteMode: "Legato", portamento: "Always", glideTime: 120,
+    routes: [
+      { dest: "Amplitude", amount: 1.0, curve: "Exponential" },
+      { dest: "FilterCutoff", amount: 0.7, curve: "Exponential" },
+      { dest: "HarmonicDrive", amount: 0.4, curve: "SCurve" },
+      { dest: "NoiseLevel", amount: 0.15, curve: "Linear" },
+    ]
+  },
+};
+```
+
+---
+
+## Phase 8: Integration with Existing Engine
+
+**This is where you connect the new system to the existing code. Be surgical — minimal changes to existing files.**
+
+1. In `engine/src/lib.rs`: add `pub mod wind;` and instantiate `WindControllerProcessor` alongside the existing voice manager.
+
+2. In the main `process()` function (wherever the per-sample or per-block audio loop lives):
+   - Call `wind_processor.process_sample()` before each voice's processing
+   - Feed `WindOutput.amplitude` as a multiplier to the voice's VCA
+   - Feed `WindOutput.filter_cutoff_mod` as an additive offset to the filter's cutoff parameter
+   - Feed `WindOutput.pitch` as the voice's pitch source (replacing or modifying the existing MIDI note → frequency conversion)
+   - Feed `WindOutput.harmonic_drive` to the drive/saturation stage (if it exists) or store for later implementation
+   - Use `WindOutput.gate` to control whether the voice is sounding
+
+3. In the MIDI handler: route incoming MIDI messages through `WindControllerProcessor` first when wind mode is enabled. The `NoteEvent` output from the wind processor replaces the raw MIDI note events for voice triggering.
+
+4. In the WASM bridge: expose the new wind controller parameters through the same `set_param` mechanism already used for other parameters.
+
+5. In the React UI: add the "WIND" tab and load `WindControllerPanel` lazily.
+
+---
+
+## Constraints & Quality Standards
+
+1. **Zero heap allocations in the audio thread.** Every struct uses fixed-size arrays. No `Vec`, no `String`, no `Box<dyn Trait>` in any per-sample code path. The `wind/` module must compile with `#![no_std]` (using `libm` for math).
+
+2. **All floating-point math uses `f32`** — 64-bit is wasteful for audio DSP and slower on WASM.
+
+3. **Every public function and struct has a doc comment** explaining what it does, why it exists, and any non-obvious design decisions.
+
+4. **Unit tests for every module.** At minimum:
+   - `smoother.rs`: step response, convergence time, snap, block vs sample equivalence
+   - `note_manager.rs`: legato detection, stack overflow, note-off fallback
+   - `breath_router.rs`: curve accuracy vs reference values, threshold hysteresis
+   - `pitch_processor.rs`: vibrato LFO frequency accuracy, bend range scaling
+   - `articulation.rs`: growl noise determinism (same seed = same output), flutter pulse shape
+
+5. **Parameter IDs are sequential and documented.** Add a block comment in `config.rs` listing every parameter with its ID, range, default, and unit.
+
+6. **No panics.** Use `.clamp()`, `.min()`, `.max()` for all value bounds. A panic in WASM kills the AudioWorklet thread with no recovery.
+
+7. **Commit after each phase is complete and tested.** Commit messages follow: `feat(wind): Phase N — description`.
+
+---
+
+## Execution Order
+
+Work through phases 1–6 sequentially. Each phase builds on the previous one. Do not skip ahead. After each phase:
+1. Run `cargo test` — all tests must pass
+2. Run `cargo clippy` — zero warnings
+3. Verify `no_std` compatibility: `cargo build --target wasm32-unknown-unknown -p hypersynth-engine`
+
+Phase 7 (UI) can be done in parallel with phases 4–6 if needed, but the Rust side must be solid first.
+
+Phase 8 (integration) comes last, after everything is individually tested.
+
+Begin with Phase 1: `smoother.rs`.
+
+
+
+# ADDENDUM — Wind Controller Prompt Patches
+
+Apply these amendments to the main WIND_CONTROLLER_PROMPT.md spec.
+These override or extend the original instructions where conflicts exist.
+
+---
+
+## AMENDMENT 1: Execution Protocol (overrides "Execution Order" section)
+
+Do NOT implement the entire spec end-to-end in one pass.
+Work in gated phases. After completing each phase:
+
+1. Stop and show me what you built (file list + key struct signatures)
+2. Run `cargo test` and `cargo clippy` — show output
+3. Write a brief note (3–5 lines max) explaining any deviation from the spec and why
+4. Wait for my approval before starting the next phase
+
+If you encounter a point where the spec conflicts with the existing codebase structure, **always follow the existing codebase conventions**. The spec provides intent and behavior requirements; the codebase provides naming, module layout, and integration patterns. When in doubt, inspect existing code first, then propose your approach before writing.
+
+Phase execution order:
+```
+Phase 1: smoother.rs          → gate: tests pass, clippy clean
+Phase 2: note_manager.rs      → gate: tests pass, legato behavior verified
+Phase 3: breath_curve.rs + breath_router.rs → gate: curve math validated against reference values
+Phase 4: pitch_processor.rs   → gate: vibrato LFO frequency measured, bend range verified
+Phase 5: articulation.rs      → gate: growl determinism test, flutter shape test
+Phase 6: mod.rs (WindControllerProcessor) → gate: full integration test with mock MIDI input
+Phase 7: Integration with existing engine → gate: cargo build --target wasm32-unknown-unknown succeeds
+Phase 8: UI (separate prompt, not part of this session)
+```
+
+Phase 8 (UI) is deliberately excluded from this prompt. It will be a separate task after the Rust side is stable and integrated.
+
+---
+
+## AMENDMENT 2: Inspect Before Implementing (new requirement for every phase)
+
+Before writing ANY code for a new phase, first run these commands and show output:
+
+```bash
+# Understand the existing engine structure
+find engine/src -name "*.rs" | head -40
+# Read the voice processing loop
+grep -n "process\|voice\|sample\|block" engine/src/lib.rs | head -30
+# Check how parameters currently flow
+grep -n "ParamId\|set_param\|param" engine/src/params.rs | head -30
+# Check existing mod matrix (if any)
+grep -rn "mod_matrix\|modulation\|ModSource" engine/src/ | head -20
+```
+
+Then write a 5-line integration plan BEFORE writing code. Example:
+```
+Integration plan for Phase 6:
+- Existing voice loop processes 64-sample blocks in Engine::render()
+- Parameters update at block boundaries via param_buffer
+- WindOutput will feed into param_buffer as additional mod sources
+- NoteEvent will be injected into the existing event queue at voice_manager.process_events()
+- Gate signal replaces velocity-based amplitude when wind mode is active
+```
+
+---
+
+## AMENDMENT 3: Filter Coefficient Interpolation (extends Phase 3)
+
+Add this requirement to BreathRouter:
+
+The smoothed breath value feeds into filter cutoff and resonance. However, smoothing the CC input alone is NOT sufficient — if the existing filter recalculates coefficients once per block (e.g., every 64 or 128 samples), coefficient jumps will still produce zipper noise or clicks.
+
+Therefore, `BreathOutput` must include a flag indicating whether the value changed significantly this block:
+
+```rust
+pub struct BreathOutput {
+    pub amplitude: f32,
+    pub filter_cutoff: f32,
+    pub harmonic_drive: f32,
+    pub filter_resonance: f32,
+    pub vibrato_depth: f32,
+    pub pitch_offset: f32,
+    pub noise_level: f32,
+    /// True if filter_cutoff or filter_resonance changed by more than
+    /// 0.001 since last block. When true, the voice's filter must
+    /// interpolate coefficients across the block, not snap.
+    pub filter_needs_interpolation: bool,
+}
+```
+
+When integrating with the existing filter (Phase 7), check how the filter currently updates coefficients:
+- If it already interpolates per-sample: just feed the smoothed value, no extra work.
+- If it updates once per block: add linear interpolation of the cutoff/resonance values across the block's samples before feeding them to the coefficient calculation. This is a minimal change to the filter's process loop (4–6 lines of code).
+
+Do NOT rewrite the existing filter. Just wrap the coefficient update with interpolation if needed.
+
+---
+
+## AMENDMENT 4: Bite Sensor Calibration (extends Phase 4)
+
+Add to `PitchProcessor`:
+
+```rust
+pub struct BiteCalibration {
+    /// Minimum raw value from the bite sensor (below this = no bite detected)
+    pub min: f32,  // default 0.05 (normalized), user range 0.0–0.3
+    /// Maximum raw value (above this = full bite)
+    pub max: f32,  // default 0.85 (normalized), user range 0.5–1.0
+}
+```
+
+Before any bite value enters the pitch/vibrato processing chain, normalize it:
+```rust
+fn normalize_bite(raw: f32, cal: &BiteCalibration) -> f32 {
+    ((raw - cal.min) / (cal.max - cal.min)).clamp(0.0, 1.0)
+}
+```
+
+User-facing parameters:
+- **"Bite Min"**: 0–30 (on 0–127 scale), default 6
+- **"Bite Max"**: 70–127 (on 0–127 scale), default 110
+
+Add a "Bite Calibration" section to the UI spec: show the raw bite value as a live bar, with draggable min/max markers. During calibration, the user bites lightly (sets min) and hard (sets max). This is how every professional wind synth plugin handles it (SWAM, Respiro, Audio Modeling).
+
+---
+
+## AMENDMENT 5: Custom Curve Data Transfer (extends Phase 3 + Phase 7)
+
+The standard `set_param(id, value)` mechanism sends a single f32. A custom breath curve requires transferring 128 f32 values (the lookup table).
+
+For the Rust side:
+```rust
+impl BreathRouter {
+    /// Receive a full custom curve table. Called from the UI bridge,
+    /// NOT from the per-sample audio path.
+    pub fn set_custom_curve(&mut self, table: &[f32; 128]) {
+        self.custom_curve_table = *table;
+    }
+}
+```
+
+For the WASM bridge (Phase 7 integration):
+- Use `wasm_bindgen` to expose `set_custom_curve` taking a `&[f32]`
+- From the AudioWorklet, send the curve data via `MessagePort.postMessage` with a `Float32Array` (transferred, not copied)
+- This is a one-time transfer when the user changes the curve, NOT per-sample
+
+Do NOT try to encode 128 values as sequential single-param updates. That is fragile and slow.
+
+---
+
+## AMENDMENT 6: Wind Processor Scope Clarification (extends Phase 6)
+
+To be explicit about a critical architectural question:
+
+**WindControllerProcessor is a GLOBAL MONO LAYER, not per-voice.**
+
+There is exactly ONE instance of WindControllerProcessor in the engine. It processes MIDI input once, produces one WindOutput per sample, and that output is shared across all voices (in poly mode) or drives the single voice (in mono/legato mode).
+
+Rationale: wind controllers are single-stream instruments. One breath, one bite, one pitch bend. Per-voice wind processing would be wasteful and semantically wrong.
+
+The integration point with the voice manager:
+- In Poly mode (wind mode disabled): voices receive NoteOn/Off directly as before. WindControllerProcessor is bypassed.
+- In Mono/Legato mode (wind mode enabled): WindControllerProcessor intercepts all MIDI. Only NoteEvents from the NoteManager reach the voice manager. Only one voice is active. WindOutput modulation values are applied to that voice's parameters.
+
+---
+
+## AMENDMENT 7: Wind as Mod Source vs. Parallel System (extends Phase 6)
+
+Clarify the relationship with the existing mod matrix:
+
+WindControllerProcessor outputs are NOT routed through the existing mod matrix. They are a **parallel modulation path** that is summed with the mod matrix outputs at the voice level.
+
+```
+Voice parameter (e.g., filter_cutoff) =
+    base_value
+  + mod_matrix_output        // from existing LFOs, ENVs, etc.
+  + wind_output.filter_cutoff_mod  // from wind processor
+```
+
+This avoids entangling the wind system with mod matrix routing complexity. If in the future we want wind breath as a mod matrix source, we add it as a new `ModSource::Breath` entry — but that is NOT part of this task.
+
+---
+
+## AMENDMENT 8: Gain Compensation for Articulation (extends Phase 5)
+
+Growl and flutter modulate amplitude, pitch, and filter simultaneously. Without compensation, extreme growl settings can produce output levels that are much louder or quieter than the dry signal.
+
+Add to `ArticulationOutput`:
+```rust
+pub struct ArticulationOutput {
+    pub amplitude_mod: f32,
+    pub pitch_mod: f32,
+    pub filter_mod: f32,
+    /// Compensation gain to maintain perceived loudness.
+    /// Applied after all articulation modulation.
+    /// Calculated as: 1.0 / (1.0 + depth * 0.3) approximately.
+    pub gain_compensation: f32,
+}
+```
+
+The final amplitude chain becomes:
+```
+output_amplitude = breath_amplitude * growl.amplitude_mod * flutter.amplitude_mod * growl.gain_compensation
+```
+
+This prevents the articulation effects from destabilizing the output level across presets.
+
+---
+
+## AMENDMENT 9: NoteEvent Timing Precision (extends Phase 6)
+
+The original spec defines `note_event: Option<NoteEvent>` in WindOutput. This is ambiguous about timing within a block.
+
+Replace with:
+
+```rust
+/// Note events are timestamped relative to the start of the current block.
+/// sample_offset = 0 means the event occurs at the first sample of the block.
+pub struct TimestampedNoteEvent {
+    pub event: NoteEvent,
+    /// Sample offset within the current processing block (0..block_size-1)
+    pub sample_offset: u32,
+}
+```
+
+And in WindOutput:
+```rust
+pub note_events: [Option<TimestampedNoteEvent>; 4],  // max 4 events per block
+pub note_event_count: usize,
+```
+
+This ensures legato transitions and note-off events are sample-accurate, not quantized to block boundaries. Without this, fast legato passages (common on EWI) will feel sluggish.
+
+Check how the existing engine handles note events — if it already has a timestamped event queue, use that format instead of inventing a new one.
+
+---
+
+## AMENDMENT 10: no_std Policy Clarification (extends Constraints section)
+
+Revised policy:
+
+The `wind/` module code that runs in the per-sample audio path MUST be allocation-free (no Vec, Box, String, HashMap in hot paths). This is non-negotiable for real-time audio safety.
+
+However, the formal `#![no_std]` attribute is only required if the existing `engine/` crate already uses `#![no_std]`. If the engine crate uses `std` (check `engine/Cargo.toml` and `engine/src/lib.rs`), then forcing `no_std` on the wind module alone creates unnecessary build friction.
+
+**Rule of thumb**: match whatever the engine already does. If engine is `no_std` with `libm`, wind is `no_std` with `libm`. If engine uses `std`, wind uses `std` but remains allocation-free in audio paths.
+
+Before starting Phase 1, check:
+```bash
+grep -n "no_std\|extern crate\|use std" engine/src/lib.rs
+cat engine/Cargo.toml | grep -A5 "\[dependencies\]"
+```
+And follow whatever convention is already established.

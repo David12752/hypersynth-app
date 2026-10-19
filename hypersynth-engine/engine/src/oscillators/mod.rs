@@ -1,0 +1,21 @@
+pub mod traits;
+pub mod va;
+pub mod wavetable;
+pub mod fm;
+pub mod additive;
+pub mod modal;
+pub mod granular;
+pub mod sampler;
+pub mod analog_circuit;
+pub mod tpt_vco;
+
+pub use traits::OscillatorEngine;
+pub use va::{VaOscillator, VaWaveform, SubOscMode};
+pub use wavetable::{WavetableOscillator, FactoryWavetable, ScanMode, FRAME_SIZE};
+pub use fm::{FmOscillator, FmAlgorithm};
+pub use additive::AdditiveOscillator;
+pub use modal::ModalOscillator;
+pub use granular::GranularOscillator;
+pub use sampler::SamplerOscillator;
+pub use analog_circuit::{CircuitOscillator, CircuitWaveform};
+pub use tpt_vco::{TptVco, TptWaveform};

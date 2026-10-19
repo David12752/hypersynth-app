@@ -1,0 +1,45 @@
+# v0 sandbox internal files
+__v0_runtime_loader.js
+__v0_devtools.tsx
+__v0_jsx-dev-runtime.ts
+.snowflake/
+.v0-trash/
+.vercel/
+next.user-config.*
+
+# Environment variables
+.env
+.env*.local
+
+# Common ignores
+node_modules
+.next/
+.DS_Store
+
+# 3-layer architecture
+.tmp/
+__pycache__/
+*.pyc
+
+# Rust build artifacts
+hypersynth-engine/target/
+
+# Electron / desktop build outputs
+electron/dist/
+release/
+build/
+
+# Logs
+*.log
+npm-debug.log*
+# Publish safety (added when preparing the public release)
+.env
+.env.*
+!.env.example
+*.bak*
+*.pfx
+*.pem
+*.key
+*.p12
+node_modules/
+target/
